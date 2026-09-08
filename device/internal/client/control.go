@@ -141,12 +141,22 @@ func (c *ControlClient) IsConnected() bool {
 
 var errPending = fmt.Errorf("pending approval")
 
-// maxStaticAttempts is how many consecutive dial failures one target in a
-// static pass gets before Run moves to the next one. 1 would tour the whole
-// list on a single transient blip — a brief drop on the endpoint actually in
-// front of the device costing a lap through every backup before trying it
-// again, which is slower than just retrying it.
-const maxStaticAttempts = 2
+// maxStaticAttempts is how many consecutive dial failures one configured
+// endpoint gets before Run moves to the next target in the pass. 1 would
+// tour the whole list on a single transient blip — a brief drop on the
+// endpoint actually in front of the device costing a lap through every
+// backup before trying it again, which is slower than just retrying it.
+//
+// maxMDNSAttempts is the same idea for the bounded mDNS slot at the end of a
+// pass, and is deliberately 1, not maxStaticAttempts: the "don't abandon the
+// endpoint in front of you too eagerly" argument is about a specific
+// configured address, which mDNS has none of — a second browse immediately
+// after the first found nothing is not "retrying the endpoint you're at",
+// it's just a slower pass.
+const (
+	maxStaticAttempts = 2
+	maxMDNSAttempts   = 1
+)
 
 // staticBackoff is the per-attempt wait after a failed static pass, indexed
 // by how many full passes (every configured endpoint, then one bounded mDNS
@@ -154,6 +164,15 @@ const maxStaticAttempts = 2
 // options and a config server (settled design, #106): two fast passes so a
 // genuinely brief blip resolves quickly, then a widening backoff so a
 // controller that is really gone isn't hammered. Holds at the last value.
+//
+// Applied per attempt, not per pass, so the wall-clock time to tour the
+// whole list scales with how many endpoints are configured — a pass at the
+// 60s tier costs roughly (len(endpoints)+1)*60s, not a flat 60s. Chosen
+// deliberately over a per-pass wait: it keeps individual dials evenly
+// spaced regardless of backoff tier, and a static list is expected to stay
+// short (the design's own examples show two or three entries), where the
+// difference is seconds, not minutes. Reconsider this if a real deployment
+// configures a long list.
 var staticBackoff = []time.Duration{
 	5 * time.Second,
 	5 * time.Second,
@@ -190,6 +209,16 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 		// exactly the one an operator cannot easily restart, so editing the
 		// file has to take effect on the very next reconnect, not at
 		// process start.
+		//
+		// A parse/validation error deliberately fails OPEN to mDNS below,
+		// same as an absent file: the overriding goal is that a device is
+		// never left unable to reach a controller, and that includes a typo
+		// in the config it cannot fix itself. This also applies to a pinned
+		// mdns:false fleet — a broken file there browses too. TLS
+		// verification bounds the blast radius (a browsed-to controller
+		// outside the fleet's CA is refused), so the failure mode is a
+		// delayed reconnect to the RIGHT controller, not a connection to
+		// the wrong one. Revisit if that stops being true.
 		static, staticErr := discovery.ConfiguredEndpoints()
 		if staticErr != nil {
 			log.Printf("[control] Static controller config invalid — using mDNS: %v", staticErr)
@@ -236,12 +265,13 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 				// The list is exhausted for this pass: one bounded mDNS
 				// browse, never the indefinitely-retrying FindServer — that
 				// would park the device there and defeat the point of
-				// having somewhere to fall through TO.
+				// having somewhere to fall through TO. maxMDNSAttempts (not
+				// maxStaticAttempts) below is what keeps this to one try.
 				log.Printf("[control] Static list exhausted — one mDNS attempt (%d/%d)",
-					targetAttempts+1, maxStaticAttempts)
+					targetAttempts+1, maxMDNSAttempts)
 				found, err := discovery.FindServerOnce(ctx)
 				if err != nil || found == nil {
-					dialErr = fmt.Errorf("mDNS: no controller found this round")
+					dialErr = fmt.Errorf("no controller found via mDNS this round")
 				} else {
 					server = found
 				}
@@ -282,6 +312,7 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 		}
 
 		var err error
+		var healthy bool
 		if server != nil {
 			dataCtx, cancelData := context.WithCancel(ctx)
 			go func() {
@@ -290,13 +321,14 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 				}
 			}()
 
-			err = c.connect(ctx, server, data)
+			healthy, err = c.connect(ctx, server, data)
 
 			cancelData()
 		} else {
 			// The bounded mDNS slot came up empty this round — no server to
 			// dial, so treat it exactly like any other failed target rather
-			// than special-casing "nothing to try."
+			// than special-casing "nothing to try." healthy stays false: no
+			// connection was even attempted.
 			err = dialErr
 		}
 
@@ -320,9 +352,27 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 			}
 		default:
 			if usingStatic {
-				if err != nil {
+				if healthy {
+					// The connection stayed up long enough to be a genuine
+					// recovery, not a connect-then-drop flap (that's what
+					// staticHealthyDuration is for) — not a fresh discovery
+					// event, so always restart at the top of the list and
+					// reset backoff, or the device could drift down the
+					// hierarchy and never climb back to its preferred
+					// endpoint, and a brief blip six hours from now would
+					// wait out a backoff tier it never earned.
+					//
+					// err is still non-nil here — connect's read loop always
+					// exits with an error, healthy or not — so this cannot
+					// be reached by checking err == nil; it never fires.
+					targetIdx, targetAttempts, passNum = 0, 0, 0
+				} else {
 					targetAttempts++
-					if targetAttempts >= maxStaticAttempts {
+					maxAttempts := maxStaticAttempts
+					if targetIdx == len(static.Endpoints) {
+						maxAttempts = maxMDNSAttempts
+					}
+					if targetAttempts >= maxAttempts {
 						targetAttempts = 0
 						targetIdx++
 						if targetIdx >= passLen {
@@ -330,13 +380,6 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 							passNum++
 						}
 					}
-				} else {
-					// A clean end to a connection that did establish is not
-					// a discovery event — always restart at the top of the
-					// list on the next attempt, or the device could drift
-					// down the hierarchy and never climb back to its
-					// preferred endpoint.
-					targetIdx, targetAttempts, passNum = 0, 0, 0
 				}
 			}
 
@@ -363,7 +406,23 @@ func (c *ControlClient) Run(ctx context.Context, data *DataClient) error {
 	}
 }
 
-func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInfo, data *DataClient) error {
+// staticHealthyDuration is how long a connection has to stay up before Run
+// treats it as a genuine recovery rather than a connect-then-drop flap. Set
+// comfortably above one keepalive round trip (wsPingInterval, 20s) so a
+// connection that resets the pass/backoff state has actually proven itself,
+// not just completed a handshake before dying again.
+const staticHealthyDuration = 30 * time.Second
+
+// connect dials server and runs the control-plane read loop until it exits.
+// The bool return reports whether the connection stayed up at least
+// staticHealthyDuration before that happened — false at every early return
+// (a dial failure, a registration error, errPending: nothing before
+// c.connectedCallback fires counts as "connected" yet), computed for real
+// only at the read loop's exit, the one place a healthy connection can
+// still end up back here.
+func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInfo, data *DataClient) (bool, error) {
+	var connectedAt time.Time
+
 	// Credentials are re-read on every dial: a "Secure link" push from the
 	// controller lands mid-run, and the very next reconnect should pick it
 	// up without a restart.
@@ -385,7 +444,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	dialer := creds.dialer()
 	conn, _, err := dialer.DialContext(ctx, baseURL+"/control", creds.header())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
@@ -431,23 +490,23 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	// Send register BEFORE publishing conn — prevents concurrent SendButton /
 	// SendMuteState from racing this write on the same gorilla conn.
 	if err := conn.WriteMessage(websocket.TextMessage, regBytes); err != nil {
-		return err
+		return false, err
 	}
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var first controlMessage
 	if err := conn.ReadJSON(&first); err != nil {
-		return err
+		return false, err
 	}
 	conn.SetReadDeadline(time.Time{})
 
 	switch first.Type {
 	case "pending":
-		return errPending
+		return false, errPending
 	case "ack":
 		// proceed
 	default:
-		return fmt.Errorf("unexpected first message: %s", first.Type)
+		return false, fmt.Errorf("unexpected first message: %s", first.Type)
 	}
 
 	log.Printf("[control] Registered as %s (version %s)", c.deviceID, Version)
@@ -469,6 +528,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	if c.connectedCallback != nil {
 		c.connectedCallback()
 	}
+	connectedAt = time.Now()
 	data.NotifyReady(baseURL)
 
 	// Keepalive — same mechanism as the data client (see wsPingInterval in
@@ -507,7 +567,7 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 	for {
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
-			return err
+			return time.Since(connectedAt) >= staticHealthyDuration, err
 		}
 		conn.SetReadDeadline(time.Now().Add(wsPongWait))
 
